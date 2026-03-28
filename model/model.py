@@ -1,11 +1,11 @@
-import math
-from typing import List, Optional, Tuple
-
-from transformers import PretrainedConfig
 import torch
+import math
 import torch.nn as nn
+from typing import Optional, Tuple, List, Union
 import torch.nn.functional as F
+from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 # huggingface的类
@@ -363,7 +363,8 @@ class HoyamindBlock(nn.Module):
         )
         return hidden_states, present_key_value
 
-class MokioMindModel(nn.Module):
+
+class HoyamindModel(nn.Module):
     def __init__(self, config: HoyamindConfig):
         super().__init__()
         self.config = config
@@ -374,7 +375,10 @@ class MokioMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
-            [HoyamindBlock(layer_idx, config) for layer_idx in range(self.num_hidden_layers)]
+            [
+                HoyamindBlock(layer_idx, config)
+                for layer_idx in range(self.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -437,10 +441,63 @@ class MokioMindModel(nn.Module):
                 layer.mlp.aux_loss
                 for layer in self.layers
                 if isinstance(
-                    layer.mlp, #MoEFeedForward
+                    layer.mlp,  # MoEFeedForward
                 )  # ！修正：原MoEFeedForaward拼写错误
             ],
             hidden_states.new_zeros(1).squeeze(),
         )
 
         return hidden_states, presents, aux_loss
+
+class HoyamindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = HoyamindConfig
+
+    def __init__(self, config: HoyamindConfig):
+        super().__init__(config)
+        self.model = HoyamindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        hidden_states, past_key_values, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
+        output.aux_loss = aux_loss
+        return output
