@@ -1,7 +1,7 @@
 import torch
 import math
-from torch.nn import init
 import torch.nn as nn
+from torch.nn import init
 from typing import Optional, Tuple, List, Union
 import torch.nn.functional as F
 from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
@@ -9,7 +9,6 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
-# huggingface的类
 class HoyamindConfig(PretrainedConfig):
     model_type = "Hoyamind"
 
@@ -81,17 +80,17 @@ class HoyamindConfig(PretrainedConfig):
         )
 
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _rms_norm(self, x):
+    def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        return (self.weight * self._rms_norm(x.float())).type_as(x)
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
 def precompute_freqs(
@@ -127,8 +126,9 @@ def precompute_freqs(
         if end / orig_max > 1.0:
             # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
             def inv_dim(b):
-                return (dim * math.log(orig_max / (b * 2 * math.pi))) / (
-                    2 * math.log(rope_base)
+                return (
+                    (dim * math.log(orig_max / (b * 2 * math.pi)))
+                    / (2 * math.log(rope_base))
                 )
 
             # 4. 计算高频区和低频区的维度切分点
@@ -319,6 +319,7 @@ class FeedForward(nn.Module):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
 
+
 class MoEGate(nn.Module):
     def __init__(self, config: HoyamindConfig):
         super().__init__()
@@ -386,8 +387,9 @@ class MoEGate(nn.Module):
         else:
             aux_loss = scores.new_zeros(1).squeeze()
         return topk_idx, topk_weight, aux_loss
-    
-class MoEFeedForward(nn.Module):  
+
+
+class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
     def __init__(self, config: HoyamindConfig):
         super().__init__()
         self.config = config
@@ -482,6 +484,7 @@ class MoEFeedForward(nn.Module):
 
         return expert_cache
 
+
 class HoyamindBlock(nn.Module):
     def __init__(self, layer_id: int, config: HoyamindConfig):
         super().__init__()
@@ -497,8 +500,8 @@ class HoyamindBlock(nn.Module):
         )
         self.mlp = (
             FeedForward(config)
-            # if not config.use_moe
-            # else MoEFeedForward(config)  # ！修正：原MoEFeedForaward拼写错误
+            if not config.use_moe
+            else MoEFeedForward(config)  # ！修正：原MoEFeedForaward拼写错误
         )
 
     def forward(
@@ -538,10 +541,7 @@ class HoyamindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
-            [
-                HoyamindBlock(layer_idx, config)
-                for layer_idx in range(self.num_hidden_layers)
-            ]
+            [HoyamindBlock(layer_idx, config) for layer_idx in range(self.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -604,13 +604,14 @@ class HoyamindModel(nn.Module):
                 layer.mlp.aux_loss
                 for layer in self.layers
                 if isinstance(
-                    layer.mlp,  # MoEFeedForward
+                    layer.mlp, MoEFeedForward
                 )  # ！修正：原MoEFeedForaward拼写错误
             ],
             hidden_states.new_zeros(1).squeeze(),
         )
 
         return hidden_states, presents, aux_loss
+
 
 class HoyamindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = HoyamindConfig
