@@ -14,31 +14,31 @@ class HoyamindConfig(PretrainedConfig):
 
     def __init__(
         self,
-        dropout: float = 0.0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: int = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
-        vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
-        rope_theta: int = 1000000,
-        inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
+        dropout: float = 0.0,  # Dropout 概率，0.0 表示不做随机失活
+        bos_token_id: int = 1,  # 句子起始 token 的 id
+        eos_token_id: int = 2,  # 句子结束 token 的 id
+        hidden_act: str = "silu",  # MLP 中使用的激活函数
+        hidden_size: int = 512,  # 隐藏层维度
+        intermediate_size: int = None,  # MLP 中间层维度，None 时按规则自动推导
+        max_position_embeddings: int = 32768,  # 支持的最大上下文长度
+        num_attention_heads: int = 8,  # 注意力头数量
+        num_hidden_layers: int = 8,  # Transformer Block 层数
+        num_key_value_heads: int = 2,  # GQA/MQA 的 KV 头数量
+        vocab_size: int = 6400,  # 词表大小
+        rms_norm_eps: float = 1e-05,  # RMSNorm 的数值稳定项
+        rope_theta: int = 1000000,  # RoPE 的基频参数（base）
+        inference_rope_scaling: bool = False,  # 推理时是否启用 YaRN RoPE 扩展
+        flash_attention: bool = True,  # 是否优先使用 PyTorch 的 Flash Attention
         ############ MoE ############
-        use_moe: bool = False,
-        num_experts_per_tok: int = 2,
-        n_routed_experts: int = 4,
-        n_shared_experts: int = 1,
-        scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.01,
-        seq_aux: bool = True,
-        norm_topk_prob: bool = True,
-        **kwargs,
+        use_moe: bool = False,  # 是否启用 Mixture-of-Experts 前馈层
+        num_experts_per_tok: int = 2,  # 每个 token 选择的专家个数（top-k）
+        n_routed_experts: int = 4,  # 可路由专家总数
+        n_shared_experts: int = 1,  # 共享专家数量（始终参与）
+        scoring_func: str = "softmax",  # 门控打分函数
+        aux_loss_alpha: float = 0.01,  # MoE 负载均衡辅助损失权重
+        seq_aux: bool = True,  # 是否使用按序列统计的辅助损失
+        norm_topk_prob: bool = True,  # 是否对 top-k 专家权重归一化
+        **kwargs,  # 透传给 PretrainedConfig 的其他参数
     ):
         super().__init__(**kwargs)
 
@@ -68,12 +68,12 @@ class HoyamindConfig(PretrainedConfig):
 
         self.rope_scaling = (
             {
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 16,
-                "original_max_position_embeddings": 2048,
-                "attention_factor": 1.0,
-                "type": "yarn",
+                "beta_fast": 32,  # YaRN 高频边界
+                "beta_slow": 1,  # YaRN 低频边界
+                "factor": 16,  # 上下文扩展倍数
+                "original_max_position_embeddings": 2048,  # 预训练时原始最大长度
+                "attention_factor": 1.0,  # 注意力温度补偿系数
+                "type": "yarn",  # RoPE 扩展策略
             }
             if self.inference_rope_scaling
             else None
@@ -126,9 +126,8 @@ def precompute_freqs(
         if end / orig_max > 1.0:
             # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
             def inv_dim(b):
-                return (
-                    (dim * math.log(orig_max / (b * 2 * math.pi)))
-                    / (2 * math.log(rope_base))
+                return (dim * math.log(orig_max / (b * 2 * math.pi))) / (
+                    2 * math.log(rope_base)
                 )
 
             # 4. 计算高频区和低频区的维度切分点
@@ -321,6 +320,15 @@ class FeedForward(nn.Module):
 
 
 class MoEGate(nn.Module):
+    """
+    MoE 路由门控模块。
+
+    输入每个 token 的隐藏状态后，输出：
+    1) `topk_idx`：每个 token 选中的专家索引；
+    2) `topk_weight`：对应专家的路由权重；
+    3) `aux_loss`：用于缓解专家负载不均衡的辅助损失。
+    """
+
     def __init__(self, config: HoyamindConfig):
         super().__init__()
         self.config = config
@@ -339,31 +347,39 @@ class MoEGate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # 使用 Kaiming 初始化门控权重，提升训练初期稳定性。
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
+        # hidden_states: [bsz, seq_len, hidden_size]
         bsz, seq_len, h = hidden_states.shape
+        # 将 batch 和序列维展平，按 token 独立计算路由分数。
         hidden_states = hidden_states.view(-1, h)
         logits = F.linear(hidden_states, self.weight, None)
 
         if self.scoring_func == "softmax":
+            # 对专家维度做 softmax，得到每个 token 到各专家的概率分布。
             scores = logits.softmax(dim=-1)
         else:
             raise NotImplementedError(
                 f"insupportable scoring function for MoE gating: {self.scoring_func}"
             )
 
+        # 选取每个 token 的 top-k 专家及其权重。
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
         if self.top_k > 1 and self.norm_topk_prob:
+            # 可选：将 top-k 权重重新归一化，保证其和为 1。
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
 
         if self.training and self.alpha > 0.0:
+            # 训练阶段计算辅助负载均衡损失，鼓励专家利用率更均匀。
             scores_for_aux = scores
             aux_topk = self.top_k
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
+                # seq_aux=True：按样本维度统计专家分配，再与平均路由概率对齐。
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
                 ce = torch.zeros(
                     bsz, self.n_routed_experts, device=hidden_states.device
@@ -377,6 +393,7 @@ class MoEGate(nn.Module):
                     dim=1
                 ).mean() * self.alpha
             else:
+                # seq_aux=False：全局统计专家频率并计算经典负载均衡项。
                 mask_ce = F.one_hot(
                     topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
                 )
@@ -385,11 +402,12 @@ class MoEGate(nn.Module):
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
+            # 推理阶段或未启用辅助损失时，返回 0。
             aux_loss = scores.new_zeros(1).squeeze()
         return topk_idx, topk_weight, aux_loss
 
 
-class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
+class MoEFeedForward(nn.Module):  
     def __init__(self, config: HoyamindConfig):
         super().__init__()
         self.config = config
@@ -486,47 +504,74 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
 
 
 class HoyamindBlock(nn.Module):
+    """
+    单个 Transformer Block,结构为:
+        x → Pre-Norm → Attention → 残差相加 → Pre-Norm → MLP/MoE → 残差相加 → 输出
+
+    采用 Pre-LayerNorm(先 Norm 再子层），训练更稳定；
+    MLP 支持普通 FeedForward 和 MoE 两种模式，由 config.use_moe 控制。
+    """
+
     def __init__(self, layer_id: int, config: HoyamindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
+        # 每个注意力头处理的向量维度
         self.head_dim = config.hidden_size // config.num_attention_heads
+        # GQA 多头自注意力模块
         self.self_attention = Attention(config)
 
+        # 记录当前 Block 在整个模型中的层索引（从 0 开始），方便调试和权重加载
         self.layer_id = layer_id
+
+        # Attention 前的 RMSNorm（Pre-Norm）
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # MLP 前的 RMSNorm（Post-Attention Pre-Norm）
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = (
-            FeedForward(config)
-            if not config.use_moe
-            else MoEFeedForward(config)  # ！修正：原MoEFeedForaward拼写错误
-        )
+        # 根据 use_moe 决定使用普通 FFN 还是 Mixture-of-Experts FFN
+        self.mlp = FeedForward(config) if not config.use_moe else MoEFeedForward(config)
 
     def forward(
         self,
-        hidden_states,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache=False,
-        attention_mask: Optional[torch.Tensor] = None,
+        hidden_states,  # [bsz, seq_len, hidden_size]
+        position_embeddings: Tuple[
+            torch.Tensor, torch.Tensor
+        ],  # (cos, sin)，由外部统一预计算传入
+        past_key_value: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # KV Cache，推理时传入历史 KV
+        use_cache=False,  # 是否将当前 KV 存入 Cache
+        attention_mask: Optional[torch.Tensor] = None,  # padding mask，[bsz, seq_len]
     ):
+        # --- 第一条支路：Self-Attention + 残差 ---
+
+        # 保存残差，用于跳跃连接
         res = hidden_states
 
+        # Pre-Norm：先对输入做 RMSNorm，再送入 Attention
+        # present_key_value：当前步的 KV，use_cache=True 时返回，否则为 None
         hidden_states, present_key_value = self.self_attention(
-            self.input_layernorm(hidden_states),  # pre-norm
+            self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
             use_cache,
             attention_mask,
         )
 
+        # 残差相加：将 Attention 输出与原始输入叠加，防止梯度消失
         hidden_states = res + hidden_states
 
+        # --- 第二条支路：MLP/MoE + 残差 ---
+
+        # Pre-Norm：先对 Attention 输出做 RMSNorm，再送入 MLP/MoE
+        # 同样采用残差相加
         hidden_states = hidden_states + self.mlp(
             self.post_attention_layernorm(hidden_states)
         )
+
+        # 返回当前层输出，以及本层 KV Cache（供下一步推理使用）
         return hidden_states, present_key_value
 
 
@@ -541,7 +586,10 @@ class HoyamindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
-            [HoyamindBlock(layer_idx, config) for layer_idx in range(self.num_hidden_layers)]
+            [
+                HoyamindBlock(layer_idx, config)
+                for layer_idx in range(self.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
