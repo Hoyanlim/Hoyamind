@@ -31,7 +31,7 @@ from trainer.trainer_utils import (  # 训练工具函数
 # 忽略警告信息，保持输出清洁
 warnings.filterwarnings("ignore")
 
-
+# 核心训练函数，手敲
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录开始时间
 
@@ -64,6 +64,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         scaler.scale(loss).backward()
 
+        # 实验记录，评估模式，保存等，不是最核心的内容，不必手敲
         if step % args.accumulation_steps == 0:
             # scaler.unscale_(): 还原梯度的真实值
             scaler.unscale_(optimizer)
