@@ -108,7 +108,7 @@ class PretrainDataset(Dataset):
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
 
-        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        # 返回 attention_mask，使 attention 层能屏蔽 padding token
         attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         return input_ids, labels, attention_mask
 
